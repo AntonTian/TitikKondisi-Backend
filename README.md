@@ -4,9 +4,9 @@ This repository contains the source code for the **Backend** service, a core com
 
 ## Getting Started
 
-To run the **User Service** locally:
+To run the **Backend Service** locally:
 
-1. Run the service on root folder:
+Run the service on root folder:
 
 ```bash
 go run main.go
