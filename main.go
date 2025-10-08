@@ -114,14 +114,20 @@ func fetchWeatherData(lat, lon string) (WeatherData, error) {
 			AQI []int `json:"european_aqi"`
 		} `json:"hourly"`
 	}
+
 	json.NewDecoder(resp.Body).Decode(&result)
+
+	aqi := 0
+	if len(result.Hourly.AQI) > time.Now().Hour() {
+		aqi = result.Hourly.AQI[time.Now().Hour()]
+	}
 
 	return WeatherData{
 		Temperature:   result.Current.Temperature,
 		Precipitation: result.Current.Precipitation,
 		CloudCover:    result.Current.CloudCover,
 		UVIndex:       result.Current.UVIndex,
-		AQI:           result.Hourly.AQI[time.Now().Hour()], // Ambil AQI jam ini
+		AQI:           aqi,
 	}, nil
 }
 
