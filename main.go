@@ -6,11 +6,11 @@ import (
 	"net/http"
 	"sync"
 	"time"
-
+	"math"
 	"github.com/gin-gonic/gin"
 )
 
-// --- Struct untuk menampung semua data ---
+// --- Struct untuk data cuaca, matahari, bulan, dan indeks ---
 type WeatherData struct {
 	Temperature   float64 `json:"temperature"`
 	Precipitation float64 `json:"precipitation"`
@@ -35,7 +35,6 @@ type CalculatedIndices struct {
 	HikingRecommendation string  `json:"hiking_recommendation"`
 }
 
-// Struct final yang akan dikirim sebagai JSON ke Flutter
 type ConsolidatedResponse struct {
 	Weather WeatherData       `json:"weather"`
 	Sun     SunData           `json:"sun"`
@@ -45,92 +44,153 @@ type ConsolidatedResponse struct {
 
 func main() {
 	r := gin.Default()
-	// Endpoint utama aplikasi
-	r.GET("/weather/:lat/:lon", getConsolidatedData)
-	fmt.Println("Backend server berjalan di http://localhost:8080")
+
+	// --- Dua endpoint: GET dan POST ---
+	r.GET("/weather/:lat/:lon", getWeatherByParams)
+	r.POST("/weather", getWeatherByJSON)
+
+	fmt.Println("Server berjalan di http://localhost:8080")
 	r.Run(":8080")
 }
 
-func getConsolidatedData(c *gin.Context) {
+// --- Handler untuk GET (pakai URL params) ---
+func getWeatherByParams(c *gin.Context) {
 	lat := c.Param("lat")
 	lon := c.Param("lon")
+	response, err := getConsolidatedData(lat, lon)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, response)
+}
 
+// --- Handler untuk POST (pakai JSON body) ---
+func getWeatherByJSON(c *gin.Context) {
+	var input struct {
+		Lat string `json:"lat"`
+		Lon string `json:"lon"`
+	}
+	if err := c.BindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	response, err := getConsolidatedData(input.Lat, input.Lon)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, response)
+}
+
+// --- Fungsi utama untuk ambil semua data ---
+func getConsolidatedData(lat, lon string) (ConsolidatedResponse, error) {
 	var weather WeatherData
 	var sun SunData
-	var wg sync.WaitGroup // Untuk menjalankan API call secara bersamaan
+	var wg sync.WaitGroup
+	var err1, err2 error
 
-	// 1. Ambil data cuaca dan AQI dari Open-Meteo
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		weather, _ = fetchWeatherData(lat, lon)
+		weather, err1 = fetchWeatherData(lat, lon)
 	}()
 
-	// 2. Ambil data matahari dari Sunrise-Sunset.org
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		sun, _ = fetchSunData(lat, lon)
+		sun, err2 = fetchSunData(lat, lon)
 	}()
 
-	wg.Wait() // Tunggu semua API call selesai
+	wg.Wait()
 
-	// 3. Kalkulasi data bulan (lokal)
+	if err1 != nil {
+		return ConsolidatedResponse{}, err1
+	}
+	if err2 != nil {
+		return ConsolidatedResponse{}, err2
+	}
+
 	moon := calculateMoonPhase()
-
-	// 4. Kalkulasi Indeks (lokal)
 	indices := calculateIndices(weather)
 
-	// Gabungkan semua data menjadi satu
-	response := ConsolidatedResponse{
+	return ConsolidatedResponse{
 		Weather: weather,
 		Sun:     sun,
 		Moon:    moon,
 		Indices: indices,
-	}
-
-	c.JSON(http.StatusOK, response)
+	}, nil
 }
 
-// --- Fungsi Helper ---
-
+// --- API Call ke Open-Meteo ---
 func fetchWeatherData(lat, lon string) (WeatherData, error) {
-	url := fmt.Sprintf("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s&current=temperature_2m,precipitation,cloud_cover,uv_index&hourly=european_aqi&timezone=auto&forecast_days=1", lat, lon)
+	// --- Fetch main weather ---
+	weatherURL := fmt.Sprintf(
+		"https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s&current=temperature_2m,precipitation,cloud_cover,uv_index&timezone=auto",
+		lat, lon,
+	)
 
-	resp, err := http.Get(url)
+	resp1, err := http.Get(weatherURL)
 	if err != nil {
-		return WeatherData{}, err
+		return WeatherData{}, fmt.Errorf("weather fetch error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer resp1.Body.Close()
 
-	var result struct {
+	if resp1.StatusCode != 200 {
+		return WeatherData{}, fmt.Errorf("weather bad response: %s", resp1.Status)
+	}
+
+	var weatherResult struct {
 		Current struct {
 			Temperature   float64 `json:"temperature_2m"`
 			Precipitation float64 `json:"precipitation"`
 			CloudCover    int     `json:"cloud_cover"`
 			UVIndex       float64 `json:"uv_index"`
 		} `json:"current"`
+	}
+
+	if err := json.NewDecoder(resp1.Body).Decode(&weatherResult); err != nil {
+		return WeatherData{}, fmt.Errorf("weather JSON decode error: %v", err)
+	}
+
+	// --- Fetch AQI separately ---
+	aqiURL := fmt.Sprintf(
+		"https://air-quality-api.open-meteo.com/v1/air-quality?latitude=%s&longitude=%s&hourly=european_aqi&timezone=auto",
+		lat, lon,
+	)
+	resp2, err := http.Get(aqiURL)
+	if err != nil {
+		return WeatherData{}, fmt.Errorf("aqi fetch error: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	var aqiResult struct {
 		Hourly struct {
 			AQI []int `json:"european_aqi"`
 		} `json:"hourly"`
 	}
 
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp2.Body).Decode(&aqiResult); err != nil {
+		fmt.Println("AQI decode error:", err)
+	}
 
 	aqi := 0
-	if len(result.Hourly.AQI) > time.Now().Hour() {
-		aqi = result.Hourly.AQI[time.Now().Hour()]
+	if len(aqiResult.Hourly.AQI) > 0 {
+		// Use latest value (last in slice)
+		aqi = aqiResult.Hourly.AQI[len(aqiResult.Hourly.AQI)-1]
 	}
 
 	return WeatherData{
-		Temperature:   result.Current.Temperature,
-		Precipitation: result.Current.Precipitation,
-		CloudCover:    result.Current.CloudCover,
-		UVIndex:       result.Current.UVIndex,
+		Temperature:   weatherResult.Current.Temperature,
+		Precipitation: weatherResult.Current.Precipitation,
+		CloudCover:    weatherResult.Current.CloudCover,
+		UVIndex:       weatherResult.Current.UVIndex,
 		AQI:           aqi,
 	}, nil
 }
 
+// --- API Call ke Sunrise-Sunset (fix golden hour) ---
 func fetchSunData(lat, lon string) (SunData, error) {
 	url := fmt.Sprintf("https://api.sunrise-sunset.org/json?lat=%s&lng=%s&formatted=0", lat, lon)
 	resp, err := http.Get(url)
@@ -141,61 +201,114 @@ func fetchSunData(lat, lon string) (SunData, error) {
 
 	var result struct {
 		Results struct {
-			Sunrise    string `json:"sunrise"`
-			Sunset     string `json:"sunset"`
-			GoldenHour string `json:"golden_hour"`
+			Sunrise string `json:"sunrise"`
+			Sunset  string `json:"sunset"`
 		} `json:"results"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return SunData{}, err
+	}
 
-	// Konversi waktu UTC ke Waktu Lokal (WIB)
-	sunriseUTC, _ := time.Parse(time.RFC3339, result.Results.Sunrise)
-	sunsetUTC, _ := time.Parse(time.RFC3339, result.Results.Sunset)
-	goldenHourUTC, _ := time.Parse(time.RFC3339, result.Results.GoldenHour)
+	sunriseUTC, err1 := time.Parse(time.RFC3339, result.Results.Sunrise)
+	sunsetUTC, err2 := time.Parse(time.RFC3339, result.Results.Sunset)
+	if err1 != nil || err2 != nil {
+		return SunData{}, fmt.Errorf("invalid time format")
+	}
 
 	loc, _ := time.LoadLocation("Asia/Jakarta")
+	sunriseLocal := sunriseUTC.In(loc)
+	sunsetLocal := sunsetUTC.In(loc)
+	goldenHourEnd := sunriseLocal.Add(time.Hour)
 
 	return SunData{
-		Sunrise:    sunriseUTC.In(loc).Format("15:04"),
-		Sunset:     sunsetUTC.In(loc).Format("15:04"),
-		GoldenHour: goldenHourUTC.In(loc).Format("15:04"),
+		Sunrise:    sunriseLocal.Format("15:04"),
+		Sunset:     sunsetLocal.Format("15:04"),
+		GoldenHour: goldenHourEnd.Format("15:04"),
 	}, nil
 }
 
+// --- Calculate Moon Phase ---
 func calculateMoonPhase() MoonData {
-	// Implementasi sederhana, di dunia nyata bisa menggunakan library astronomi
-	return MoonData{PhaseName: "Sabit Awal", Illumination: 0.25}
+	now := time.Now().UTC()
+	newMoon := time.Date(2000, 1, 6, 18, 14, 0, 0, time.UTC)
+	days := now.Sub(newMoon).Hours() / 24
+	phase := math.Mod(days, 29.53058867) / 29.53058867
+
+	var phaseName string
+	switch {
+	case phase < 0.03 || phase > 0.97:
+		phaseName = "Bulan Baru"
+	case phase < 0.25:
+		phaseName = "Sabit Awal"
+	case phase < 0.27:
+		phaseName = "Kuartal Pertama"
+	case phase < 0.50:
+		phaseName = "Cembung Awal"
+	case phase < 0.53:
+		phaseName = "Bulan Purnama"
+	case phase < 0.75:
+		phaseName = "Cembung Akhir"
+	case phase < 0.77:
+		phaseName = "Kuartal Akhir"
+	default:
+		phaseName = "Sabit Akhir"
+	}
+
+	illum := phase
+	if illum > 0.5 {
+		illum = 1 - illum
+	}
+	illum *= 2
+
+	return MoonData{PhaseName: phaseName, Illumination: math.Round(illum*100) / 100}
 }
 
+// --- Calculate Hiking Index ---
 func calculateIndices(weather WeatherData) CalculatedIndices {
-	score := 10.0
-	if weather.Temperature > 32 || weather.Temperature < 15 {
+	score := 10
+
+	if weather.Temperature > 33 {
+		score -= 3
+	} else if weather.Temperature < 18 {
 		score -= 2
 	}
-	if weather.Precipitation > 0.5 {
+
+	if weather.Precipitation > 1 {
+		score -= 4
+	}
+
+	if weather.UVIndex > 8 {
+		score -= 2
+	}
+
+	if weather.AQI > 100 {
 		score -= 3
 	}
-	if weather.UVIndex > 7 {
-		score -= 1.5
+
+	if weather.CloudCover > 80 {
+		score -= 1
 	}
-	if weather.AQI > 100 {
-		score -= 1.5
-	}
-	if score < 1 {
-		score = 1.0
+
+	if score < 0 {
+		score = 0
+	} else if score > 10 {
+		score = 10
 	}
 
 	var recommendation string
-	if score >= 8 {
+	switch {
+	case score >= 8:
 		recommendation = "Sangat baik untuk mendaki!"
-	} else if score >= 5 {
-		recommendation = "Cukup baik, tetap waspada."
-	} else {
-		recommendation = "Kurang ideal, pertimbangkan kembali."
+	case score >= 5:
+		recommendation = "Cukup baik, tetapi perhatikan cuaca."
+	case score >= 3:
+		recommendation = "Kurang disarankan, kondisi tidak ideal."
+	default:
+		recommendation = "Tidak disarankan untuk mendaki hari ini."
 	}
 
 	return CalculatedIndices{
-		HikingIndex:          score,
+		HikingIndex:          math.Round(float64(score) * 10) / 10,
 		HikingRecommendation: recommendation,
 	}
 }
